@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RHP ⇄ MIDI Converter</title>
+<style>
+:root{--bg:#eef1f7;--ink:#1b2340;--mute:#5d6685;--line:#cfd6e6;--card:#fff;--acc:#3b5bdb;--roll:#f6f8fc}
+@media (prefers-color-scheme:dark){:root{--bg:#12162a;--ink:#e8ecfa;--mute:#98a2c4;--line:#2b3358;--card:#1a2040;--acc:#7b95ff;--roll:#141935}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Avenir Next","Segoe UI",system-ui,sans-serif}
+main{max-width:760px;margin:0 auto;padding:32px 18px 56px}
+h1{font-size:1.9rem;margin:0 0 4px;letter-spacing:-.02em}
+p.lead{margin:0 0 22px;color:var(--mute)}
+#drop{display:block;border:2px dashed var(--line);border-radius:14px;background:var(--card);padding:34px 18px;text-align:center;cursor:pointer}
+#drop.over,#drop:focus-within{border-color:var(--acc)}
+#drop b{display:block;font-size:1.1rem}
+#drop span{color:var(--mute);font-size:.92rem}
+input[type=file]{position:absolute;opacity:0;width:1px;height:1px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:11px 18px;background:var(--acc);color:#fff;cursor:pointer}
+button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+#out{display:none;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-top:18px}
+#out h2{margin:0 0 2px;font-size:1.25rem}
+#meta{color:var(--mute);margin:0 0 12px}
+canvas{width:100%;height:190px;display:block;border-radius:10px;background:var(--roll)}
+ul{list-style:none;padding:0;margin:12px 0 0;display:grid;gap:4px}
+li{display:flex;align-items:center;gap:8px;font-size:.95rem}
+li i{width:12px;height:12px;border-radius:3px;flex:none}
+#err{color:#d6336c;margin-top:12px;min-height:1.4em}
+footer{margin-top:28px;color:var(--mute);font-size:.88rem}
+code{background:var(--card);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+</style>
+</head>
+<body>
+<main>
+<h1>RHP ⇄ MIDI Converter</h1>
+<p class="lead">Ubah file <code>.rhp</code> menjadi MIDI, atau MIDI menjadi <code>.rhp</code>. Semua diproses di browser Anda, tidak ada file yang diunggah ke server.</p>
+
+<label id="drop">
+  <input type="file" id="file" accept=".rhp,.mid,.midi">
+  <b>Pilih atau seret file ke sini</b>
+  <span>.rhp, .mid, atau .midi</span>
+</label>
+<div class="row"><button class="alt" id="demo" type="button">Buat file contoh</button></div>
+<div id="err" role="alert"></div>
+
+<section id="out">
+  <h2 id="title"></h2>
+  <p id="meta"></p>
+  <canvas id="roll" width="1400" height="380"></canvas>
+  <ul id="tracks"></ul>
+  <div class="row" id="actions"></div>
+</section>
+
+<footer>Format <code>.rhp</code>: header <code>RHP1</code> + panjang (4 byte) + JSON terkompresi zlib. Not disimpan sebagai <code>[mulai, durasi, nada, velocity]</code>.</footer>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const COLORS = ["#3b5bdb","#e8590c","#2f9e44","#c2255c","#7048e8","#1098ad","#f08c00","#5c940d"];
+let current = null, baseName = "lagu";
+
+/* ---------- zlib via bawaan browser ---------- */
+async function pipe(bytes, Ctor){
+  const s = new Blob([bytes]).stream().pipeThrough(new Ctor("deflate"));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+const deflate = b => pipe(b, CompressionStream);
+const inflate = b => pipe(b, DecompressionStream);
+
+/* ---------- RHP ---------- */
+async function readRhp(u8){
+  if (String.fromCharCode(...u8.slice(0,4)) !== "RHP1") throw new Error("Bukan file RHP yang valid (header RHP1 tidak ditemukan).");
+  const len = new DataView(u8.buffer, u8.byteOffset).getUint32(4, true);
+  const json = await inflate(u8.slice(8, 8 + len));
+  return JSON.parse(new TextDecoder().decode(json));
+}
+async function writeRhp(data){
+  const p = await deflate(new TextEncoder().encode(JSON.stringify(data)));
+  const out = new Uint8Array(8 + p.length);
+  out.set([82,72,80,49]);
+  new DataView(out.buffer).setUint32(4, p.length, true);
+  out.set(p, 8);
+  return out;
+}
+
+/* ---------- MIDI writer ---------- */
+const vlq = n => { const o=[n&127]; n>>=7; while(n){o.unshift((n&127)|128); n>>=7;} return o; };
+const u32 = n => [(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255];
+const u16 = n => [(n>>8)&255,n&255];
+const chunk = (tag, body) => [...tag].map(c=>c.charCodeAt(0)).concat(u32(body.length), body);
+const meta = (d,t,body) => [...vlq(d),255,t,...vlq(body.length),...body];
+const utf8 = s => [...new TextEncoder().encode(s)];
+
+function toMidi(data){
+  const ppq = data.ppq || 480, bpm = data.tempo || 120;
+  const us = Math.round(60000000 / bpm);
+  let t0 = [];
+  if (data.title) t0 = t0.concat(meta(0,3,utf8(data.title)));
+  t0 = t0.concat(meta(0,0x51,[(us>>16)&255,(us>>8)&255,us&255]), meta(0,0x2f,[]));
+  let out = chunk("MThd", [...u16(1),...u16((data.tracks||[]).length+1),...u16(ppq)]).concat(chunk("MTrk", t0));
+  for (const tr of data.tracks || []){
+    const ch = (tr.channel||0) & 15, ev = [[0,0,[0xC0|ch,(tr.program||0)&127]]];
+    for (const [s,d,p,v] of tr.notes){
+      const pitch = Math.max(0,Math.min(127,p|0)), vel = Math.max(1,Math.min(127,v|0));
+      ev.push([s,1,[0x90|ch,pitch,vel]], [s+Math.max(1,d),0,[0x80|ch,pitch,0]]);
+    }
+    ev.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+    let body = tr.name ? meta(0,3,utf8(tr.name)) : [], last = 0;
+    for (const [t,,m] of ev){ body = body.concat(vlq(t-last), m); last = t; }
+    out = out.concat(chunk("MTrk", body.concat(meta(0,0x2f,[]))));
+  }
+  return new Uint8Array(out);
+}
+
+/* ---------- MIDI reader ---------- */
+function fromMidi(u8){
+  if (String.fromCharCode(...u8.slice(0,4)) !== "MThd") throw new Error("Bukan file MIDI yang valid.");
+  const dv = new DataView(u8.buffer, u8.byteOffset);
+  const ntrk = dv.getUint16(10), ppq = dv.getUint16(12);
+  let i = 8 + dv.getUint32(4);
+  const data = {title:"", tempo:120, ppq, tracks:[]};
+  let gotTempo = false;
+  const rv = () => { let n=0,c; do { c=u8[j++]; n=(n<<7)|(c&127); } while(c&128); return n; };
+  let j = 0;
+  for (let k=0;k<ntrk && i<u8.length;k++){
+    if (String.fromCharCode(...u8.slice(i,i+4)) !== "MTrk") break;
+    const end = i + 8 + dv.getUint32(i+4); j = i + 8; i = end;
+    let tick=0, status=0, name="";
+    const active = {}, notes = {}, prog = {};
+    while (j < end){
+      tick += rv();
+      if (u8[j] & 128) status = u8[j++];
+      if (status === 255){
+        const t = u8[j++], n = rv(), body = u8.slice(j, j+n); j += n;
+        if (t === 3){ const s = new TextDecoder().decode(body); if(!data.title) data.title = s; name = s; }
+        else if (t === 0x51 && !gotTempo){ data.tempo = Math.round(6e7/((body[0]<<16)|(body[1]<<8)|body[2])*100)/100; gotTempo = true; }
+      } else if (status === 240 || status === 247){ j += rv(); }
+      else {
+        const kind = status & 240, ch = status & 15;
+        if (kind === 0xC0 || kind === 0xD0){ if(kind===0xC0 && prog[ch]===undefined) prog[ch]=u8[j]; j++; }
+        else {
+          const a = u8[j++], v = u8[j++], key = ch+":"+a;
+          if (kind === 0x90 && v > 0) active[key] = [tick, v];
+          else if (kind === 0x80 || kind === 0x90){
+            const st = active[key];
+            if (st){ (notes[ch] = notes[ch]||[]).push([st[0], tick-st[0], a, st[1]]); delete active[key]; }
+          }
+        }
+      }
+    }
+    for (const ch of Object.keys(notes).sort((a,b)=>a-b)){
+      notes[ch].sort((a,b)=>a[0]-b[0]);
+      data.tracks.push({name: name || "Track "+(data.tracks.length+1), channel:+ch, program:prog[ch]||0, notes:notes[ch]});
+    }
+  }
+  return data;
+}
+
+/* ---------- UI ---------- */
+function draw(data){
+  const c = $("roll"), g = c.getContext("2d");
+  g.clearRect(0,0,c.width,c.height);
+  const all = data.tracks.flatMap(t=>t.notes);
+  if (!all.length) return;
+  const maxT = Math.max(...all.map(n=>n[0]+n[1])), lo = Math.min(...all.map(n=>n[2]))-1, hi = Math.max(...all.map(n=>n[2]))+1;
+  const h = c.height/(hi-lo+1);
+  data.tracks.forEach((t,k)=>{
+    g.fillStyle = COLORS[k % COLORS.length];
+    for (const [s,d,p] of t.notes) g.fillRect(s/maxT*c.width, c.height-(p-lo+1)*h, Math.max(2,d/maxT*c.width-1), Math.max(2,h-1));
+  });
+}
+function download(bytes, name, type){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes],{type}));
+  a.download = name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+}
+function show(data, from){
+  current = data;
+  const n = data.tracks.reduce((s,t)=>s+t.notes.length,0);
+  $("title").textContent = data.title || baseName;
+  $("meta").textContent = `${data.tempo} BPM, ${data.tracks.length} track, ${n} not`;
+  $("tracks").innerHTML = data.tracks.map((t,k)=>`<li><i style="background:${COLORS[k%COLORS.length]}"></i>${t.name.replace(/</g,"&lt;")} (${t.notes.length} not)</li>`).join("");
+  const act = $("actions"); act.innerHTML = "";
+  const mk = (label, fn, alt) => { const b = document.createElement("button"); b.textContent = label; b.type="button"; if(alt) b.className="alt"; b.onclick = fn; act.append(b); };
+  if (from === "rhp") mk("Unduh .mid", () => download(toMidi(current), baseName+".mid", "audio/midi"));
+  else mk("Unduh .rhp", async () => download(await writeRhp(current), baseName+".rhp", "application/octet-stream"));
+  mk("Unduh keduanya", async () => { download(toMidi(current), baseName+".mid","audio/midi"); download(await writeRhp(current), baseName+".rhp","application/octet-stream"); }, true);
+  $("out").style.display = "block";
+  draw(data);
+}
+async function handle(file){
+  $("err").textContent = "";
+  try{
+    baseName = file.name.replace(/\.[^.]+$/, "") || "lagu";
+    const u8 = new Uint8Array(await file.arrayBuffer());
+    const isMidi = String.fromCharCode(...u8.slice(0,4)) === "MThd";
+    show(isMidi ? fromMidi(u8) : await readRhp(u8), isMidi ? "mid" : "rhp");
+  }catch(e){ $("out").style.display="none"; $("err").textContent = e.message; }
+}
+$("file").onchange = e => e.target.files[0] && handle(e.target.files[0]);
+const drop = $("drop");
+["dragover","dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => e.dataTransfer.files[0] && handle(e.dataTransfer.files[0]));
+$("demo").onclick = () => {
+  const ppq = 480;
+  baseName = "contoh";
+  show({title:"Contoh RHP", tempo:110, ppq, tracks:[
+    {name:"Melodi", channel:0, program:0, notes:[60,62,64,65,67,69,71,72].map((p,k)=>[k*ppq,ppq,p,90])},
+    {name:"Bass", channel:1, program:33, notes:[36,41,43,36].map((p,k)=>[k*2*ppq,2*ppq,p,80])}
+  ]}, "rhp");
+};
+</script>
+</body>
+</html>
